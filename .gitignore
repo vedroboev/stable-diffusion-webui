@@ -17,4 +17,6 @@ __pycache__
 /webui-user.bat
 /webui-user.sh
 /interrogate
+/gfpgan
 /user.css
+/*.ckpt
