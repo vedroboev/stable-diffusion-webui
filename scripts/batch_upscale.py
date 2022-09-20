@@ -24,20 +24,19 @@ def get_grid_size(new_width, new_height, upscale_factor=2.0, width=512, height=5
 
     return rows * cols
 
-def calculate_total_steps(images, upscale_factor, patch_width=512, patch_height=512, overlap=64):
+def calculate_total_steps(images, upscale_factor, patch_width=512, patch_height=512, overlap=64, batch_size=1, n_iter=1):
     total = 0
     for path in images:
         try:
             img = Image.open(path)
-            total += get_grid_size(img.width, img.height, upscale_factor, patch_width, patch_height, overlap)
+            size = get_grid_size(img.width, img.height, upscale_factor, patch_width, patch_height, overlap)
+            total += math.ceil(size / batch_size)
         except:
             continue
-    return total
+    return total * n_iter
 
 
 def sd_upscale(p : StableDiffusionProcessing, img: Image, upscale_overlap: int):
-    initial_info = None
-
     fix_seed(p)
     seed = p.seed
 
@@ -46,6 +45,8 @@ def sd_upscale(p : StableDiffusionProcessing, img: Image, upscale_overlap: int):
     grid = images.split_grid(img, tile_w=p.width, tile_h=p.height, overlap=upscale_overlap)
     
     batch_size = p.batch_size
+    upscale_count = p.n_iter
+    p.n_iter = 1
 
     work = []
 
@@ -55,10 +56,11 @@ def sd_upscale(p : StableDiffusionProcessing, img: Image, upscale_overlap: int):
 
     batch_count = math.ceil(len(work) / batch_size)
 
-    print(f"SD upscaling will process a total of {len(work)} images tiled as {len(grid.tiles[0][2])}x{len(grid.tiles)} per upscale in a total of {batch_count} batches.")
-
     result_images = []
-    for n in range(p.n_iter):
+    for n in range(upscale_count):
+        print(f"Running iteration {n + 1} / {upscale_count}.")
+        print(f"SD upscaling will process a total of {len(work)} images tiled as {len(grid.tiles[0][2])}x{len(grid.tiles)} per upscale in a total of {batch_count} batches.")
+
         start_seed = seed + n
         p.seed = start_seed
 
@@ -67,11 +69,8 @@ def sd_upscale(p : StableDiffusionProcessing, img: Image, upscale_overlap: int):
             p.batch_size = batch_size
             p.init_images = work[i*batch_size:(i+1)*batch_size]
 
-            state.job = f"Batch {i + 1 + n * batch_count} out of {batch_count}"
+            state.job = f"Batch {i + 1} out of {batch_count}"
             processed = process_images(p)
-
-            if initial_info is None:
-                initial_info = processed.info
 
             p.seed = processed.seed + 1
             work_results += processed.images
@@ -83,8 +82,9 @@ def sd_upscale(p : StableDiffusionProcessing, img: Image, upscale_overlap: int):
                 image_index += 1
 
         combined_image = images.combine_grid(grid)
+        result_images.append(combined_image)
     
-    return combined_image
+    return result_images
 
 
 class Script(scripts.Script):
@@ -105,7 +105,7 @@ class Script(scripts.Script):
             upscaler_scale = gr.Slider(minimum=1.5, maximum=8.0, step=0.25, label="Resize", value=2.0)
 
         with gr.Group():
-            sd_upscale = gr.Checkbox(label="SD upscale", value=True)
+            sd_upscale = gr.Checkbox(label="Use SD upscale.", value=True)
             sd_upscale_overlap = gr.Slider(minimum=0, maximum=256, step=16, label='Tile overlap', value=64)
 
         sd_upscale.change(lambda value: {sd_upscale_overlap : gr_show(value)}, inputs=[sd_upscale], outputs=[sd_upscale_overlap])
@@ -117,22 +117,22 @@ class Script(scripts.Script):
 
         images = [file for file in [os.path.join(input_dir, x) for x in os.listdir(input_dir)] if os.path.isfile(file)]
 
-        print(f"Will upscale {len(images)} images by {upscaler_scale}x.")
+        print(f"Starting... Will upscale {len(images)} images by a factor of {upscaler_scale}.")
 
-        p.n_iter = 1
-        p.batch_size = 1
         p.batch_count = 1
         p.do_not_save_grid = True
         p.do_not_save_samples = True
 
-        state.job_count = calculate_total_steps(images, upscaler_scale, p.height, p.width, sd_upscale_overlap) if do_sd_upscale else len(images)
+        upscale_count = p.n_iter
+
+        state.job_count = calculate_total_steps(images, upscaler_scale, p.height, p.width, sd_upscale_overlap, batch_size=p.batch_size, n_iter=p.n_iter) if do_sd_upscale else len(images)
 
         for index, path in enumerate(images):
             if state.interrupted:
                 break
 
             try:
-                img = Image.open(path)
+                img = Image.open(path).convert("RGB")
             except:
                 print(f"Error processing {path}:", file=sys.stderr)
                 print(traceback.format_exc(), file=sys.stderr)
@@ -143,11 +143,12 @@ class Script(scripts.Script):
 
             upscaled_img = upscaler.upscale(img, img.width * upscaler_scale, img.height * upscaler_scale)
             
-            if do_sd_upscale:
-                upscaled_img = sd_upscale(p, upscaled_img, sd_upscale_overlap)
+            p.n_iter = upscale_count
+            upscaled_imgs = sd_upscale(p, upscaled_img, sd_upscale_overlap) if do_sd_upscale else [upscaled_img]
 
-            filename = os.path.basename(path)
-            upscaled_img.save(os.path.join(output_dir, filename))
+            for prefix, image in enumerate(upscaled_imgs):
+                filename = f"{prefix:03}_{os.path.basename(path)}"
+                image.save(os.path.join(output_dir, filename))
             
             if not do_sd_upscale:
                 state.nextjob()
